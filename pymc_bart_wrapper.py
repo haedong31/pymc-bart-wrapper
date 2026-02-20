@@ -23,9 +23,11 @@ import pandas as pd
 import pymc as pm
 import pymc_bart as pmb
 from scipy.special import softmax
+from sklearn.preprocessing import OneHotEncoder
 
 
-# Constant used to fill missing numeric values (outside typical positive range)
+# Constant used to fill missing numeric values outside typical range
+# Numetric columns in our dataset are positive so -99 would be a safe out-of-range constant
 MISSING_NUMERIC_FILL = -99
 
 
@@ -90,6 +92,7 @@ class BARTModelWrapper:
         self.category_codes_ = None   # pd.Index of target class labels
         self.category_map_ = None     # dict: code → label
         self.n_classes_ = None        # number of target classes
+        self.ohe_encoder_ = None      # fitted sklearn OneHotEncoder
         self.ohe_columns_ = None      # list of columns after one-hot encoding
         self.numeric_vars_ = None     # numeric predictor columns kept
         self.fitted_ = False
@@ -168,7 +171,7 @@ class BARTModelWrapper:
                 y_codes = df[self.target_var].map(mapping).astype(np.int64).values
                 self.category_codes_ = pd.Index(sorted_vals)
             else:
-                # Categorical (unordered) or ordinal with string target (alpha order)
+                # Categorical (unordered) or ordinal with string target (alphabetical order)
                 cat_target = pd.Categorical(df[self.target_var])
                 y_codes = cat_target.codes.astype(np.int64)
                 _, self.category_codes_ = pd.factorize(df[self.target_var], sort=True)
@@ -178,18 +181,24 @@ class BARTModelWrapper:
 
         # ----- One-hot encode categorical predictors ----------------------
         if cat_vars:
-            df_cat = pd.get_dummies(df[cat_vars], columns=cat_vars, drop_first=False, dtype=float)
             if fit:
-                self.ohe_columns_ = list(df_cat.columns)
+                # Fit the encoder on training data; unknown categories at
+                # prediction time will be encoded as all-zeros.
+                self.ohe_encoder_ = OneHotEncoder(
+                    sparse_output=False,
+                    handle_unknown="ignore",
+                    dtype=np.float64,
+                )
+                encoded = self.ohe_encoder_.fit_transform(df[cat_vars])
+                self.ohe_columns_ = list(self.ohe_encoder_.get_feature_names_out(cat_vars))
             else:
-                # Align columns with training set (add missing, drop extra)
-                for col in self.ohe_columns_:
-                    if col not in df_cat.columns:
-                        df_cat[col] = 0.0
-                df_cat = df_cat[self.ohe_columns_]
+                # Reuse the encoder fitted during training
+                encoded = self.ohe_encoder_.transform(df[cat_vars])
+            df_cat = pd.DataFrame(encoded, columns=self.ohe_columns_, index=df.index)
         else:
             df_cat = pd.DataFrame(index=df.index)
             if fit:
+                self.ohe_encoder_ = None
                 self.ohe_columns_ = []
 
         # ----- Assemble final predictor matrix ----------------------------
