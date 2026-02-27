@@ -22,12 +22,11 @@ import numpy as np
 import pandas as pd
 import pymc as pm
 import pymc_bart as pmb
-from scipy.special import softmax
 from sklearn.preprocessing import OneHotEncoder
 
 
 # Constant used to fill missing numeric values outside typical range
-# Numetric columns in our dataset are positive so -99 would be a safe out-of-range constant
+# Numeric columns in our dataset are positive so -99 would be a safe out-of-range constant
 MISSING_NUMERIC_FILL = -99
 
 
@@ -58,10 +57,13 @@ class BARTModelWrapper:
             used; if string-valued, alphabetical ordering is used.
     fill_missing : bool
         If True, fill missing values:
-        - Numeric columns → filled with MISSING_NUMERIC_FILL (-99).
+        - Numeric columns → filled with missing_numeric_fill (default -99).
         - Categorical columns → filled with a new "missing" category.
         If False, rows containing any missing value (across target
             and selected predictors) are dropped.
+    missing_numeric_fill : float or int
+        Value used to impute missing numeric predictors when fill_missing=True.
+        Defaults to the module-level constant MISSING_NUMERIC_FILL (-99).
     """
 
     _VALID_TARGET_TYPES = ("categorical", "ordinal")
@@ -74,6 +76,7 @@ class BARTModelWrapper:
         target_type: str = "categorical",
         ordinal_order: Optional[list[str]] = None,
         fill_missing: bool = True,
+        missing_numeric_fill: float | int = MISSING_NUMERIC_FILL,
     ):
         if target_type not in self._VALID_TARGET_TYPES:
             raise ValueError(
@@ -85,6 +88,7 @@ class BARTModelWrapper:
         self.target_type = target_type
         self.ordinal_order = list(ordinal_order) if ordinal_order is not None else None
         self.fill_missing = fill_missing
+        self.missing_numeric_fill = missing_numeric_fill
 
         # Populated during fit / preprocess --------------------------------
         self.model_ = None
@@ -95,6 +99,7 @@ class BARTModelWrapper:
         self.ohe_encoder_ = None      # fitted sklearn OneHotEncoder
         self.ohe_columns_ = None      # list of columns after one-hot encoding
         self.numeric_vars_ = None     # numeric predictor columns kept
+        self.X_shared_ = None         # pm.Data reference for out-of-sample prediction
         self.fitted_ = False
 
     # ------------------------------------------------------------------
@@ -141,7 +146,7 @@ class BARTModelWrapper:
         if self.fill_missing:
             # Numeric columns: fill NaN with a constant outside data range
             for col in numeric_vars:
-                df[col] = df[col].fillna(MISSING_NUMERIC_FILL)
+                df[col] = df[col].fillna(self.missing_numeric_fill)
             # Categorical columns: fill NaN with a new "missing" level
             for col in cat_vars:
                 df[col] = df[col].fillna("missing").astype(str)
@@ -217,6 +222,7 @@ class BARTModelWrapper:
         df: pd.DataFrame,
         m: int = 50,
         chains: int = 4,
+        cores: int = 1,
         draws: int = 1000,
         tune: int = 1000,
         separate_trees: bool = False,
@@ -236,6 +242,10 @@ class BARTModelWrapper:
             Number of trees for the BART prior (default 50).
         chains : int
             Number of MCMC chains (default 4).
+        cores : int
+            Number of parallel cores for sampling (default 1).
+            Use 1 for sequential sampling, which is more reliable in
+                Jupyter notebooks.  
         draws : int
             Number of posterior draws per chain (default 1000).
         tune : int
@@ -261,18 +271,18 @@ class BARTModelWrapper:
         X, y_codes = self.preprocess(df, fit=True)
 
         if self.target_type == "categorical":
-            model, idata = self._fit_categorical(
+            model, idata, X_shared = self._fit_categorical(
                 X, y_codes, m=m, separate_trees=separate_trees,
-                chains=chains, draws=draws, tune=tune,
+                chains=chains, cores=cores, draws=draws, tune=tune,
                 random_seed=random_seed,
                 sample_posterior_predictive=sample_posterior_predictive,
                 compute_convergence_checks=compute_convergence_checks,
                 **sample_kwargs,
             )
         else:  # ordinal
-            model, idata = self._fit_ordinal(
+            model, idata, X_shared = self._fit_ordinal(
                 X, y_codes, m=m,
-                chains=chains, draws=draws, tune=tune,
+                chains=chains, cores=cores, draws=draws, tune=tune,
                 random_seed=random_seed,
                 sample_posterior_predictive=sample_posterior_predictive,
                 compute_convergence_checks=compute_convergence_checks,
@@ -281,6 +291,7 @@ class BARTModelWrapper:
 
         self.model_ = model
         self.idata_ = idata
+        self.X_shared_ = X_shared
         self.fitted_ = True
 
         return self
@@ -288,7 +299,7 @@ class BARTModelWrapper:
     # --- Private model builders -------------------------------------------
 
     def _fit_categorical(
-        self, X, y_codes, *, m, separate_trees, chains, draws, tune,
+        self, X, y_codes, *, m, separate_trees, chains, cores, draws, tune,
         random_seed, sample_posterior_predictive, compute_convergence_checks,
         **sample_kwargs,
     ):
@@ -301,9 +312,10 @@ class BARTModelWrapper:
         }
 
         with pm.Model(coords=coords) as model:
+            X_shared = pm.Data("X", X.values)
             mu = pmb.BART(
                 "mu",
-                X,
+                X_shared,
                 y_codes,
                 m=m,
                 separate_trees=separate_trees,
@@ -313,7 +325,7 @@ class BARTModelWrapper:
             y = pm.Categorical("y", p=theta.T, observed=y_codes)
 
             idata = pm.sample(
-                draws=draws, tune=tune, chains=chains,
+                draws=draws, tune=tune, chains=chains, cores=cores,
                 random_seed=random_seed,
                 compute_convergence_checks=compute_convergence_checks,
                 **sample_kwargs,
@@ -321,28 +333,35 @@ class BARTModelWrapper:
             if sample_posterior_predictive:
                 pm.sample_posterior_predictive(idata, extend_inferencedata=True)
 
-        return model, idata
+        return model, idata, X_shared
 
     def _fit_ordinal(
-        self, X, y_codes, *, m, chains, draws, tune,
+        self, X, y_codes, *, m, chains, cores, draws, tune,
         random_seed, sample_posterior_predictive, compute_convergence_checks,
         **sample_kwargs,
     ):
         """Build and sample the ordinal BART model (OrderedLogistic)."""
         n_classes = self.n_classes_
 
+        # Evenly spaced initial cutpoints so every class starts with
+        # non-negligible probability, avoiding log(0) at initialisation.
+        init_cutpoints = np.linspace(-2, 2, n_classes - 1)
+
         with pm.Model() as model:
+            X_shared = pm.Data("X", X.values)
+
             # BART provides a 1-D latent score per observation
-            mu = pmb.BART("mu", X, y_codes, m=m)
+            mu = pmb.BART("mu", X_shared, y_codes, m=m)
 
             # Cutpoints that partition the latent scale into n_classes bins.
             # The ordered transform ensures cutpoints[0] < cutpoints[1] < ...
             cutpoints = pm.Normal(
                 "cutpoints",
-                mu=0,
+                mu=init_cutpoints,
                 sigma=1.5,
                 shape=n_classes - 1,
                 transform=pm.distributions.transforms.ordered,
+                initval=init_cutpoints,
             )
 
             y = pm.OrderedLogistic(
@@ -350,7 +369,7 @@ class BARTModelWrapper:
             )
 
             idata = pm.sample(
-                draws=draws, tune=tune, chains=chains,
+                draws=draws, tune=tune, chains=chains, cores=cores,
                 random_seed=random_seed,
                 compute_convergence_checks=compute_convergence_checks,
                 **sample_kwargs,
@@ -358,7 +377,7 @@ class BARTModelWrapper:
             if sample_posterior_predictive:
                 pm.sample_posterior_predictive(idata, extend_inferencedata=True)
 
-        return model, idata
+        return model, idata, X_shared
 
     # ------------------------------------------------------------------
     # Prediction
@@ -369,12 +388,12 @@ class BARTModelWrapper:
         random_seed: int = 42,
     ) -> dict:
         """
-        Generate predictions for new data.
+        Generate out-of-sample predictions for new data.
 
-        Uses pymc_bart.predict to obtain out-of-sample BART predictions.  
-        For categorical targets, softmax is applied;
-            for ordinal targets, cumulative logistic probabilities are
-            computed using the posterior cutpoints.
+        Uses the official PyMC approach: swap the shared covariate
+        matrix via pm.Data.set_value, then call
+        pm.sample_posterior_predictive to draw from the full
+        generative model (BART trees + likelihood jointly).
 
         Parameters
         ----------
@@ -387,102 +406,52 @@ class BARTModelWrapper:
         Returns
         -------
         result : dict
-            "probabilities": array of shape (n_samples, n_obs, n_classes)
-                with class probabilities per posterior draw.
+            "posterior_predictive": array of shape
+                (n_samples, n_obs) with integer class-code draws
+                from the posterior predictive distribution.
             "predicted_classes": array of shape (n_obs,) with the
                 most-likely class code (mode across posterior draws).
             "predicted_labels": list of str with the human-readable
                 class labels corresponding to predicted_classes.
             "class_prob_mean": array of shape (n_obs, n_classes) with
-                posterior-mean class probabilities per observation.
+                posterior-mean class probabilities per observation
+                (empirical frequency across draws).
         """
         if not self.fitted_:
             raise RuntimeError("Model has not been fitted yet. Call .fit() first.")
 
         X_new, _ = self.preprocess(new_data, fit=False)
 
-        rng = np.random.default_rng(random_seed)
+        # Swap the shared covariate matrix with new data and draw
+        # from the full posterior predictive (BART + likelihood).
+        with self.model_:
+            self.X_shared_.set_value(X_new.values)
+            ppc = pm.sample_posterior_predictive(
+                self.idata_, random_seed=random_seed,
+            )
 
-        # pmb.predict returns posterior predictions for the BART component.
-        mu_pred = pmb.predict(self.idata_, rng, X_new=X_new, size=None)
+        # Extract predicted class codes: (chain, draw, n_obs)
+        y_pred = ppc.posterior_predictive["y"].values
+        y_pred_flat = y_pred.reshape(-1, y_pred.shape[-1])  # (n_samples, n_obs)
 
-        if self.target_type == "categorical":
-            probs = self._predict_categorical(mu_pred)
-        else:
-            probs = self._predict_ordinal(mu_pred)
+        n_samples, n_obs = y_pred_flat.shape
+        n_classes = self.n_classes_
 
-        # Mean probabilities across posterior draws
-        class_prob_mean = probs.mean(axis=0)  # (n_obs, n_classes)
+        # Compute empirical class probabilities from posterior draws
+        class_prob_mean = np.zeros((n_obs, n_classes))
+        for c in range(n_classes):
+            class_prob_mean[:, c] = (y_pred_flat == c).mean(axis=0)
 
-        # Point prediction: class with highest mean probability
+        # Point prediction: class with highest posterior predictive probability
         predicted_classes = class_prob_mean.argmax(axis=1)
         predicted_labels = [self.category_map_[c] for c in predicted_classes]
 
         return {
-            "probabilities": probs,
+            "posterior_predictive": y_pred_flat,
             "predicted_classes": predicted_classes,
             "predicted_labels": predicted_labels,
             "class_prob_mean": class_prob_mean,
         }
-
-    # --- Private prediction helpers ---------------------------------------
-
-    def _predict_categorical(self, mu_pred: np.ndarray) -> np.ndarray:
-        """Apply softmax to BART output for categorical prediction."""
-        # mu_pred shape: (n_samples, n_classes, n_obs)
-        probs = softmax(mu_pred, axis=1)
-        return np.transpose(probs, (0, 2, 1))  # (n_samples, n_obs, n_classes)
-
-    @staticmethod
-    def _cumulative_log_probs(eta: np.ndarray, cutpoints: np.ndarray) -> np.ndarray:
-        """
-        Compute ordinal class probabilities via the cumulative logit model.
-
-        Parameters
-        ----------
-        eta : array, shape (n_obs,)
-            Latent score per observation (one posterior draw).
-        cutpoints : array, shape (K-1,)
-            Sorted cutpoints for K ordinal classes.
-
-        Returns
-        -------
-        probs : array, shape (n_obs, K)
-        """
-        from scipy.special import expit  # logistic sigmoid
-
-        K = len(cutpoints) + 1
-        n_obs = len(eta)
-        probs = np.empty((n_obs, K), dtype=np.float64)
-
-        # cumulative P(Y <= k) = sigmoid(cutpoint_k - eta)
-        cum = expit(cutpoints[np.newaxis, :] - eta[:, np.newaxis])  # (n_obs, K-1)
-
-        probs[:, 0] = cum[:, 0]
-        for k in range(1, K - 1):
-            probs[:, k] = cum[:, k] - cum[:, k - 1]
-        probs[:, K - 1] = 1.0 - cum[:, -1]
-
-        # Clip to avoid tiny negatives from floating-point arithmetic
-        np.clip(probs, 0.0, 1.0, out=probs)
-        return probs
-
-    def _predict_ordinal(self, mu_pred: np.ndarray) -> np.ndarray:
-        """Compute ordinal class probabilities from BART latent + cutpoints."""
-        # mu_pred shape: (n_samples, n_obs)
-        # Posterior cutpoints: (n_chains, n_draws, K-1)
-        cutpoints_post = self.idata_.posterior["cutpoints"].values  # (chains, draws, K-1)
-        n_chains, n_draws, _ = cutpoints_post.shape
-        cutpoints_flat = cutpoints_post.reshape(n_chains * n_draws, -1)  # (n_samples, K-1)
-
-        n_samples, n_obs = mu_pred.shape
-        n_classes = self.n_classes_
-        probs = np.empty((n_samples, n_obs, n_classes), dtype=np.float64)
-
-        for s in range(n_samples):
-            probs[s] = self._cumulative_log_probs(mu_pred[s], cutpoints_flat[s])
-
-        return probs
 
     # ------------------------------------------------------------------
     # Convenience accessors

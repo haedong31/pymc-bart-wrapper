@@ -4,26 +4,22 @@ Example: Using the BARTModelWrapper with modelDataDeIdentified.csv
 This script demonstrates both target_type options:
   1. "categorical": unordered multiclass classification
   2. "ordinal"    : ordered integer / ordinal classification
-
-The dataset contains hemoglobin-related lab results for predicting a
-`finalized_label` diagnosis.
 """
 
-import sys
-import os
-
 import pandas as pd
-
-# ── make the data/ folder importable ──────────────────────────────────────────
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "data"))
-
-from pymc_bart_wrapper import BARTModelWrapper  # noqa: E402
+from pathlib import Path
+from pymc_bart_wrapper import BARTModelWrapper
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Load data
 # ─────────────────────────────────────────────────────────────────────────────
-DATA_PATH = os.path.join(os.path.dirname(__file__), "data", "modelDataDeIdentified.csv")
-df = pd.read_csv(DATA_PATH)
+DATA_PATH = Path('./data/modelDataDeIdentified.parquet')
+if DATA_PATH.suffix == '.csv':
+    df = pd.read_csv(DATA_PATH)
+elif DATA_PATH.suffix == '.parquet':
+    df = pd.read_parquet(DATA_PATH)
+else:
+    raise ValueError(f"Unsupported file format: {DATA_PATH.suffix}")
 
 print(f"Dataset shape: {df.shape}")
 print(f"Target classes: {df['finalized_label'].unique().tolist()}")
@@ -33,7 +29,7 @@ print(f"Target distribution:\n{df['finalized_label'].value_counts()}\n")
 TARGET = "finalized_label"
 
 PREDICTOR_VARS = [
-    # Numeric hemoglobin quantitation results
+    # Numeric predictors
     "pat_age_at_test",
     "hgb_a", "hgb_f", "hgb_s", "hgb_c",
     "hgb_a2", "hgb_a2_variant",
@@ -72,7 +68,8 @@ cat_wrapper = BARTModelWrapper(
     predictor_vars=PREDICTOR_VARS,
     non_numeric_vars=NON_NUMERIC_VARS,
     target_type="categorical",       # <-- unordered multiclass
-    impute_missing=True,             # fill NaN with -99 / "missing"
+    impute_missing=True,             # fill NaN with missing_numeric_fill / "missing"
+    missing_numeric_fill=-99,        # custom fill value for missing numerics
 )
 print(cat_wrapper)
 
