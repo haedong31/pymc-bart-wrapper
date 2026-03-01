@@ -64,6 +64,14 @@ class BARTModelWrapper:
     missing_numeric_fill : float or int
         Value used to impute missing numeric predictors when fill_missing=True.
         Defaults to the module-level constant MISSING_NUMERIC_FILL (-99).
+
+    Notes
+    -----
+    If the full dataset is available before splitting into training and
+        test sets, call register_data(df) first so that the one-hot
+        encoder and target encoding are learned from all categories.  
+    If register_data is never called, encoders are learned from the
+        training set only and unknown test-set categories are encoded as all-zeros.
     """
 
     _VALID_TARGET_TYPES = ("categorical", "ordinal")
@@ -100,7 +108,89 @@ class BARTModelWrapper:
         self.ohe_columns_ = None      # list of columns after one-hot encoding
         self.numeric_vars_ = None     # numeric predictor columns kept
         self.X_shared_ = None         # pm.Data reference for out-of-sample prediction
+        self.encoder_fitted_ = False  # True after register_data() pre-fits encoders
         self.fitted_ = False
+
+    # ------------------------------------------------------------------
+    # Data registration (optional)
+    # ------------------------------------------------------------------
+    def register_data(self, df: pd.DataFrame) -> "BARTModelWrapper":
+        """
+        Pre-fit encoders on the full dataset before train / test split.
+
+        Call this before fit() so that the one-hot encoder and
+            target-variable encoding are learned from all available data.
+        This guarantees that every category present in the full dataset
+            is represented in the encoding, and avoids the all-zeros
+            fallback for categories that appear only in the test set.
+        If this method is never called, fit() and predict(),
+            encoders are learned from the training set only, 
+            and unknown test-set categories are encoded as all-zeros.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            The **complete** dataset (before splitting into training
+            and test sets).  Must contain the target column and all
+            predictor columns.
+
+        Returns
+        -------
+        self
+            The wrapper instance (for method chaining).
+        """
+        df = df.copy()
+
+        # ----- Determine predictor variable types -------------------------
+        if self.non_numeric_vars is not None:
+            numeric_vars = [v for v in self.predictor_vars if v not in self.non_numeric_vars]
+            cat_vars = [v for v in self.non_numeric_vars if v in self.predictor_vars]
+        else:
+            numeric_vars = [v for v in self.predictor_vars if pd.api.types.is_numeric_dtype(df[v])]
+            cat_vars = []
+            dropped = set(self.predictor_vars) - set(numeric_vars)
+            if dropped:
+                warnings.warn(
+                    f"Non-numeric predictors dropped (no non_numeric_vars list provided): {dropped}"
+                )
+
+        self.numeric_vars_ = numeric_vars
+
+        # ----- Handle missing values for encoding -------------------------
+        if self.fill_missing:
+            for col in cat_vars:
+                df[col] = df[col].fillna("missing").astype(str)
+        else:
+            cols_needed = numeric_vars + cat_vars + [self.target_var]
+            df = df.dropna(subset=cols_needed).reset_index(drop=True)
+
+        # ----- Learn target encoding from full data -----------------------
+        if self.target_type == "ordinal" and self.ordinal_order is not None:
+            self.category_codes_ = pd.Index(self.ordinal_order)
+        elif self.target_type == "ordinal" and pd.api.types.is_integer_dtype(df[self.target_var]):
+            sorted_vals = sorted(df[self.target_var].dropna().unique())
+            self.category_codes_ = pd.Index(sorted_vals)
+        else:
+            _, self.category_codes_ = pd.factorize(df[self.target_var], sort=True)
+
+        self.category_map_ = {i: label for i, label in enumerate(self.category_codes_)}
+        self.n_classes_ = len(self.category_codes_)
+
+        # ----- Fit OHE on full data ---------------------------------------
+        if cat_vars:
+            self.ohe_encoder_ = OneHotEncoder(
+                sparse_output=False,
+                handle_unknown="ignore",
+                dtype=np.float64,
+            )
+            self.ohe_encoder_.fit(df[cat_vars])
+            self.ohe_columns_ = list(self.ohe_encoder_.get_feature_names_out(cat_vars))
+        else:
+            self.ohe_encoder_ = None
+            self.ohe_columns_ = []
+
+        self.encoder_fitted_ = True
+        return self
 
     # ------------------------------------------------------------------
     # Preprocessing
@@ -108,6 +198,12 @@ class BARTModelWrapper:
     def preprocess(self, df: pd.DataFrame, *, fit: bool = True) -> tuple[pd.DataFrame, np.ndarray | None]:
         """
         Prepare the data for the BART model.
+
+        When register_data() has been called first, the one-hot
+            encoder and target encoding learned from 
+            the full dataset are reused here.  
+        Otherwise, encoders are fitted from scratch on the training data (fit=True) 
+            or reused from the training run (fit=False).
 
         Parameters
         ----------
@@ -160,33 +256,51 @@ class BARTModelWrapper:
         # ----- Encode target variable -------------------------------------
         y_codes = None
         if fit:
-            if self.target_type == "ordinal" and self.ordinal_order is not None:
-                # Use the user-supplied ordering
-                ordered_cat = pd.Categorical(
-                    df[self.target_var],
-                    categories=self.ordinal_order,
-                    ordered=True,
-                )
-                y_codes = ordered_cat.codes.astype(np.int64)
-                self.category_codes_ = pd.Index(self.ordinal_order)
-            elif self.target_type == "ordinal" and pd.api.types.is_integer_dtype(df[self.target_var]):
-                # Integer target – use natural ordering
-                sorted_vals = sorted(df[self.target_var].dropna().unique())
-                mapping = {v: i for i, v in enumerate(sorted_vals)}
-                y_codes = df[self.target_var].map(mapping).astype(np.int64).values
-                self.category_codes_ = pd.Index(sorted_vals)
+            if self.encoder_fitted_:
+                # Encoders were pre-fitted via register_data(); 
+                #   reuse them to map this subset's target to integer codes.
+                if self.target_type == "ordinal" and self.ordinal_order is not None:
+                    ordered_cat = pd.Categorical(
+                        df[self.target_var],
+                        categories=self.ordinal_order,
+                        ordered=True,
+                    )
+                    y_codes = ordered_cat.codes.astype(np.int64)
+                elif self.target_type == "ordinal" and pd.api.types.is_integer_dtype(df[self.target_var]):
+                    mapping = {v: i for i, v in enumerate(self.category_codes_)}
+                    y_codes = df[self.target_var].map(mapping).astype(np.int64).values
+                else:
+                    cat_target = pd.Categorical(
+                        df[self.target_var],
+                        categories=self.category_codes_,
+                    )
+                    y_codes = cat_target.codes.astype(np.int64)
             else:
-                # Categorical (unordered) or ordinal with string target (alphabetical order)
-                cat_target = pd.Categorical(df[self.target_var])
-                y_codes = cat_target.codes.astype(np.int64)
-                _, self.category_codes_ = pd.factorize(df[self.target_var], sort=True)
+                # Learn encodings from this (training) data
+                if self.target_type == "ordinal" and self.ordinal_order is not None:
+                    ordered_cat = pd.Categorical(
+                        df[self.target_var],
+                        categories=self.ordinal_order,
+                        ordered=True,
+                    )
+                    y_codes = ordered_cat.codes.astype(np.int64)
+                    self.category_codes_ = pd.Index(self.ordinal_order)
+                elif self.target_type == "ordinal" and pd.api.types.is_integer_dtype(df[self.target_var]):
+                    sorted_vals = sorted(df[self.target_var].dropna().unique())
+                    mapping = {v: i for i, v in enumerate(sorted_vals)}
+                    y_codes = df[self.target_var].map(mapping).astype(np.int64).values
+                    self.category_codes_ = pd.Index(sorted_vals)
+                else:
+                    cat_target = pd.Categorical(df[self.target_var])
+                    y_codes = cat_target.codes.astype(np.int64)
+                    _, self.category_codes_ = pd.factorize(df[self.target_var], sort=True)
 
-            self.category_map_ = {i: label for i, label in enumerate(self.category_codes_)}
-            self.n_classes_ = len(self.category_codes_)
+                self.category_map_ = {i: label for i, label in enumerate(self.category_codes_)}
+                self.n_classes_ = len(self.category_codes_)
 
         # ----- One-hot encode categorical predictors ----------------------
         if cat_vars:
-            if fit:
+            if fit and not self.encoder_fitted_:
                 # Fit the encoder on training data; unknown categories at
                 # prediction time will be encoded as all-zeros.
                 self.ohe_encoder_ = OneHotEncoder(
@@ -197,12 +311,12 @@ class BARTModelWrapper:
                 encoded = self.ohe_encoder_.fit_transform(df[cat_vars])
                 self.ohe_columns_ = list(self.ohe_encoder_.get_feature_names_out(cat_vars))
             else:
-                # Reuse the encoder fitted during training
+                # Reuse the encoder fitted during register_data() or training
                 encoded = self.ohe_encoder_.transform(df[cat_vars])
             df_cat = pd.DataFrame(encoded, columns=self.ohe_columns_, index=df.index)
         else:
             df_cat = pd.DataFrame(index=df.index)
-            if fit:
+            if fit and not self.encoder_fitted_:
                 self.ohe_encoder_ = None
                 self.ohe_columns_ = []
 
@@ -322,7 +436,9 @@ class BARTModelWrapper:
                 dims=["classes", "n_obs"],
             )
             theta = pm.Deterministic("theta", pm.math.softmax(mu, axis=0))
-            y = pm.Categorical("y", p=theta.T, observed=y_codes)
+            # shape=mu.shape[1] makes the observation count dynamic so
+            # pm.sample_posterior_predictive works after X.set_value(X_test)
+            y = pm.Categorical("y", p=theta.T, observed=y_codes, shape=mu.shape[1])
 
             idata = pm.sample(
                 draws=draws, tune=tune, chains=chains, cores=cores,
@@ -364,8 +480,11 @@ class BARTModelWrapper:
                 initval=init_cutpoints,
             )
 
+            # shape=mu.shape makes the observation count dynamic so
+            # pm.sample_posterior_predictive works after X.set_value(X_test)
             y = pm.OrderedLogistic(
                 "y", eta=mu, cutpoints=cutpoints, observed=y_codes,
+                shape=mu.shape,
             )
 
             idata = pm.sample(
@@ -476,10 +595,12 @@ class BARTModelWrapper:
 
     def __repr__(self) -> str:
         status = "fitted" if self.fitted_ else "not fitted"
+        enc = "full-data" if self.encoder_fitted_ else "train-only"
         return (
             f"BARTModelWrapper(target='{self.target_var}', "
             f"target_type='{self.target_type}', "
             f"n_predictors={len(self.predictor_vars)}, "
             f"fill_missing={self.fill_missing}, "
+            f"encoding={enc}, "
             f"status={status})"
         )
