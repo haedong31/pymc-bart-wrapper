@@ -148,10 +148,10 @@ class BARTModelWrapper:
         else:
             numeric_vars = [v for v in self.predictor_vars if pd.api.types.is_numeric_dtype(df[v])]
             cat_vars = []
-            dropped = set(self.predictor_vars) - set(numeric_vars)
-            if dropped:
+            excluded = set(self.predictor_vars) - set(numeric_vars)
+            if excluded:
                 warnings.warn(
-                    f"Non-numeric predictors dropped (no non_numeric_vars list provided): {dropped}"
+                    f"Non-numeric predictors excluded (no non_numeric_vars list provided): {excluded}"
                 )
 
         self.numeric_vars_ = numeric_vars
@@ -232,10 +232,10 @@ class BARTModelWrapper:
             # Drop any non-numeric predictor columns
             numeric_vars = [v for v in self.predictor_vars if pd.api.types.is_numeric_dtype(df[v])]
             cat_vars = []
-            dropped = set(self.predictor_vars) - set(numeric_vars)
-            if dropped:
+            excluded = set(self.predictor_vars) - set(numeric_vars)
+            if excluded:
                 warnings.warn(
-                    f"Non-numeric predictors dropped (no non_numeric_vars list provided): {dropped}"
+                    f"Non-numeric predictors excluded (no non_numeric_vars list provided): {excluded}"
                 )
 
         # ----- Handle missing values --------------------------------------
@@ -258,23 +258,13 @@ class BARTModelWrapper:
         if fit:
             if self.encoder_fitted_:
                 # Encoders were pre-fitted via register_data(); 
-                #   reuse them to map this subset's target to integer codes.
-                if self.target_type == "ordinal" and self.ordinal_order is not None:
-                    ordered_cat = pd.Categorical(
-                        df[self.target_var],
-                        categories=self.ordinal_order,
-                        ordered=True,
-                    )
-                    y_codes = ordered_cat.codes.astype(np.int64)
-                elif self.target_type == "ordinal" and pd.api.types.is_integer_dtype(df[self.target_var]):
-                    mapping = {v: i for i, v in enumerate(self.category_codes_)}
-                    y_codes = df[self.target_var].map(mapping).astype(np.int64).values
-                else:
-                    cat_target = pd.Categorical(
-                        df[self.target_var],
-                        categories=self.category_codes_,
-                    )
-                    y_codes = cat_target.codes.astype(np.int64)
+                #   reuse the stored category_codes_ to map target values to integer codes
+                cat_target = pd.Categorical(
+                    df[self.target_var],
+                    categories=self.category_codes_,
+                    ordered=(self.target_type == "ordinal"),
+                )
+                y_codes = cat_target.codes.astype(np.int64)
             else:
                 # Learn encodings from this (training) data
                 if self.target_type == "ordinal" and self.ordinal_order is not None:
@@ -302,7 +292,7 @@ class BARTModelWrapper:
         if cat_vars:
             if fit and not self.encoder_fitted_:
                 # Fit the encoder on training data; unknown categories at
-                # prediction time will be encoded as all-zeros.
+                #   prediction time will be encoded as all-zeros.
                 self.ohe_encoder_ = OneHotEncoder(
                     sparse_output=False,
                     handle_unknown="ignore",
