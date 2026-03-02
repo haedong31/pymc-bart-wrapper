@@ -358,6 +358,8 @@ class BARTModelWrapper:
             If True, fit independent trees per category.  
             Only used when target_type="categorical".  
             Reduces posterior variance but increases computation time.
+            See Fitting independent trees in the PyMC-BART docs for details:
+            https://www.pymc.io/projects/bart/en/latest/examples/bart_categorical_hawks.html
         random_seed : int
             Random seed for reproducibility.
         sample_posterior_predictive : bool
@@ -427,7 +429,7 @@ class BARTModelWrapper:
             )
             theta = pm.Deterministic("theta", pm.math.softmax(mu, axis=0))
             # shape=mu.shape[1] makes the observation count dynamic so
-            # pm.sample_posterior_predictive works after X.set_value(X_test)
+            #   pm.sample_posterior_predictive works after X.set_value(X_test)
             y = pm.Categorical("y", p=theta.T, observed=y_codes, shape=mu.shape[1])
 
             idata = pm.sample(
@@ -499,16 +501,14 @@ class BARTModelWrapper:
         """
         Generate out-of-sample predictions for new data.
 
-        Uses the official PyMC approach: swap the shared covariate
-        matrix via pm.Data.set_value, then call
-        pm.sample_posterior_predictive to draw from the full
-        generative model (BART trees + likelihood jointly).
+        Swap the shared covariate matrix via pm.Data.set_value, 
+            then call pm.sample_posterior_predictive to draw from 
+            the full generative model (BART trees + likelihood jointly).
 
         Parameters
         ----------
         new_data : pd.DataFrame
-            New observations with the same predictor columns used in
-            training.
+            New observations with the same predictor columns used in training.
         random_seed : int
             Random seed for reproducibility.
 

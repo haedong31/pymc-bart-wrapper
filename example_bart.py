@@ -1,9 +1,14 @@
-"""
-Example: Using the BARTModelWrapper with modelDataDeIdentified.csv
+"""Example: Using the BARTModelWrapper with modelDataDeIdentified.parquet
 
 This script demonstrates both target_type options:
   1. "categorical": unordered multiclass classification
   2. "ordinal"    : ordered integer / ordinal classification
+
+It also demonstrates how to use ``register_data(df)`` to let the
+wrapper learn all category encodings from the *full* dataset before
+the train / test split.  This ensures that every category is
+represented in the encoding.  ``register_data`` is optional — if
+omitted, encoders are learned from the training set only.
 """
 
 import pandas as pd
@@ -68,9 +73,12 @@ cat_wrapper = BARTModelWrapper(
     predictor_vars=PREDICTOR_VARS,
     non_numeric_vars=NON_NUMERIC_VARS,
     target_type="categorical",       # <-- unordered multiclass
-    impute_missing=True,             # fill NaN with missing_numeric_fill / "missing"
+    fill_missing=True,               # fill NaN with missing_numeric_fill / "missing"
     missing_numeric_fill=-99,        # custom fill value for missing numerics
 )
+
+# Pre-fit encoders on the full dataset so every category is known.
+cat_wrapper.register_data(df)
 print(cat_wrapper)
 
 # Fit (reduce draws/trees for demo speed; increase for real analysis)
@@ -119,8 +127,11 @@ ord_wrapper = BARTModelWrapper(
     non_numeric_vars=NON_NUMERIC_VARS,
     target_type="ordinal",           # <-- ordered outcome
     ordinal_order=ORDINAL_ORDER,     #     explicit severity ordering
-    impute_missing=True,
+    fill_missing=True,
 )
+
+# Pre-fit encoders on the full dataset.
+ord_wrapper.register_data(df)
 print(ord_wrapper)
 
 # Fit (reduce draws/trees for demo speed; increase for real analysis)
