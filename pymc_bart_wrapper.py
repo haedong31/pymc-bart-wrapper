@@ -10,8 +10,9 @@ Two target types are supported via the target_type parameter:
     Uses pmb.BART (1-D latent) → pm.OrderedLogistic with learned cutpoints.
 It handles data preprocessing (missing value imputation or removal,
     one-hot encoding of categorical variables) and follows the model
-    specification from the official PyMC-BART categorical regression example:
+    specification from the official PyMC-BART categorical and ordinal regression example:
     https://www.pymc.io/projects/bart/en/latest/examples/bart_categorical_hawks.html
+    https://www.pymc.io/projects/examples/en/latest/statistical_rethinking_lectures/11-Ordered_Categories.html
 """
 
 import warnings
@@ -468,7 +469,7 @@ class BARTModelWrapper:
                 mu=init_cutpoints,
                 sigma=1.5,
                 shape=n_classes - 1,
-                transform=pm.distributions.transforms.ordered,
+                transform=pm.distributions.transforms.univariate_ordered,
                 initval=init_cutpoints,
             )
 
